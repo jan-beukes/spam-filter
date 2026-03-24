@@ -8,7 +8,7 @@ use std::path::Path;
 const TEST_DATA: &str = "data/enron2";
 const TRAINING_DATA: [&str; 2] = ["data/enron1", "data/enron2"];
 
-fn tokenize(content: &str) -> impl Iterator<Item = String> + use<'_> {
+fn tokenize(content: &str) -> impl Iterator<Item = String> + '_ {
     content.split_whitespace()
         .map(|s| {
             s.to_lowercase()
@@ -58,7 +58,14 @@ impl Bow {
             if path.is_dir() {
                 continue;
             } else {
-                let content = std::fs::read_to_string(path)?;
+                let content = match std::fs::read_to_string(path) {
+                    Ok(s) => s,
+                    Err(e) => if matches!(e.kind(), io::ErrorKind::InvalidData) {
+                        continue;
+                    } else {
+                        return Err(e);
+                    },
+                };
                 self.load_string(&content)?;
                 self.total_documents += 1;
             }
@@ -113,19 +120,18 @@ impl SpamFilter {
 
     fn load_from_file(path: &str) -> Result<SpamFilter, io::Error> {
         fn read_bow(string: &str, bow: &mut Bow) {
-            let lines: Vec<_> = string.lines().collect();
-            let [name, docs, words] = lines[0].split_ascii_whitespace().collect::<Vec<_>>()[..] else {
+            let lines: Vec<_> = string.trim().lines().collect();
+            let [_, docs, words, ..] = lines[0].split_ascii_whitespace().collect::<Vec<_>>()[..] else {
                 panic!("Could not parse Bow line");
             };
              
-            println!("Loading {name}");
             bow.total_documents = docs.parse().unwrap();
-            bow.total_words = docs.parse().unwrap();
-            println!("docs: {docs} words: {words}");
-            for line in lines {
+            bow.total_words = words.parse().unwrap();
+            for line in lines[1..].iter() {
                 if line.is_empty() { continue }
                 let toks: Vec<&str> = line.split(":").collect();
                 let [word, freq] = toks[..] else {
+                    println!("{line}");
                     panic!("Could not parse Bow line");
                 };
                 bow.words.insert(word.to_string(), freq.parse::<u32>().unwrap());
@@ -139,9 +145,10 @@ impl SpamFilter {
         sf.ham_bow = Bow::new();
 
         let s = &content;
-        let spam_end = content.find('}').expect("Expeted '}' in model file");
-        read_bow(&s[..spam_end], &mut sf.spam_bow);
-        read_bow(&s[spam_end+1..], &mut sf.ham_bow);
+        let end_spam = s.find('}').expect("Expeted '}' in model file");
+        let end_ham = s.rfind('}').expect("Expeted '}' in model file");
+        read_bow(&s[..end_spam], &mut sf.spam_bow);
+        read_bow(&s[end_spam+1..end_ham], &mut sf.ham_bow);
 
         let total_documents = sf.spam_bow.total_documents + sf.ham_bow.total_documents;
         sf.prob_spam = sf.spam_bow.total_documents as f64 / total_documents as f64;
@@ -167,19 +174,10 @@ impl SpamFilter {
     fn fit_data(&mut self, data_dirs: &[&str]) {
         for dir in data_dirs {
             let dir_path = Path::new(dir);
-            match self.spam_bow.load_entire_dir(&dir_path.join("spam")) {
-                Err(e) => if !matches!(e.kind(), io::ErrorKind::InvalidData) {
-                    panic!("{}", e);
-                },
-                Ok(_) => (),
-            };
-
-            match self.ham_bow.load_entire_dir(&dir_path.join("ham")) {
-                Err(e) => if !matches!(e.kind(), io::ErrorKind::InvalidData) {
-                    panic!("{}", e);
-                },
-                Ok(_) => (),
-            };
+            self.spam_bow.load_entire_dir(&dir_path.join("spam"))
+                .expect("Could not load data from dir");
+            self.ham_bow.load_entire_dir(&dir_path.join("ham"))
+                .expect("Could not load data from dir");
         }
 
         let total_documents = self.spam_bow.total_documents + self.ham_bow.total_documents;
@@ -230,8 +228,14 @@ impl SpamFilter {
         let correct_spam = spam_entries.map(|entry| entry.expect("Could not read entry").path())
             .filter(|path| {
                 if !path.is_file() { return false }
-                let doc = Bow::from_file(path)
-                    .expect("Could not read words from file");
+                let doc = match Bow::from_file(path) {
+                    Ok(bow) => bow,
+                    Err(e) => if matches!(e.kind(), io::ErrorKind::InvalidData) {
+                        return false;
+                    } else {
+                        panic!("{}", e);
+                    },
+                };
                 total += 1;
                 self.predict(&doc).is_spam()
             }).count();
@@ -239,15 +243,21 @@ impl SpamFilter {
         let correct_ham = ham_entries.map(|entry| entry.expect("Could not read entry").path())
             .filter(|path| {
                 if !path.is_file() { return false }
-                let doc = Bow::from_file(path)
-                    .expect("Could not read words from file");
+                let doc = match Bow::from_file(path) {
+                    Ok(bow) => bow,
+                    Err(e) => if matches!(e.kind(), io::ErrorKind::InvalidData) {
+                        return false;
+                    } else {
+                        panic!("{}", e);
+                    },
+                };
                 total += 1;
                 self.predict(&doc).is_ham()
             }).count();
 
         let correct = correct_spam + correct_ham;
         println!("Correctly classified {correct}/{total}");
-        println!("Accuracy: {}", correct as f64 / total as f64);
+        println!("Accuracy: {:.4}", correct as f64 / total as f64);
     }
 }
 
@@ -258,7 +268,9 @@ fn main() {
     let mut test = false;
     if args.len() > 1 {
         if args[1] == "test" {
-            test_dir = Some(&args[1]);
+            if args.len() > 2 {
+                test_dir = Some(&args[2]);
+            }
             test = true;
         } else {
             let mut files: Vec<&str> = Vec::new();
@@ -307,8 +319,10 @@ fn main() {
 
     for result in results {
         match result {
-            (file, Classification::Spam(confidence)) => println!("{file}: SPAM ({confidence})"),
-            (file, Classification::Ham(confidence)) => println!("{file}: NOT SPAM ({confidence})"),
+            (file, Classification::Spam(confidence)) =>
+                println!("{file}: SPAM ({:.4}%)", 100.0*confidence),
+            (file, Classification::Ham(confidence)) =>
+                println!("{file}: NOT SPAM ({:.4}%)", 100.0*confidence),
         }
     }
 }
