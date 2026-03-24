@@ -1,3 +1,5 @@
 spam
 email.txt
 model.sf
+data/enron*
+!data/enron*.tar.gz

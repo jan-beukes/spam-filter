@@ -5,8 +5,10 @@ use std::fs;
 use fs::File;
 use std::path::Path;
 
-const TEST_DATA: &str = "data/enron2";
-const TRAINING_DATA: [&str; 2] = ["data/enron1", "data/enron2"];
+use Classification::*;
+
+const TEST_SET: &str = "data/enron5";
+const TRAINING_SET: [&str; 4] = ["data/enron1", "data/enron2", "data/enron3", "data/enron4"];
 
 fn tokenize(content: &str) -> impl Iterator<Item = String> + '_ {
     content.split_whitespace()
@@ -120,19 +122,17 @@ impl SpamFilter {
 
     fn load_from_file(path: &str) -> Result<SpamFilter, io::Error> {
         fn read_bow(string: &str, bow: &mut Bow) {
-            let lines: Vec<_> = string.trim().lines().collect();
-            let [_, docs, words, ..] = lines[0].split_ascii_whitespace().collect::<Vec<_>>()[..] else {
-                panic!("Could not parse Bow line");
+            let mut lines = string.lines().map(|l| l.trim()).filter(|l| !l.is_empty());
+            let header: Vec<&str> = lines.next().unwrap().split_whitespace().collect();
+            let [_, docs, words, _] = header[..] else {
+                panic!("Could not parse Bow header")
             };
              
             bow.total_documents = docs.parse().unwrap();
             bow.total_words = words.parse().unwrap();
-            for line in lines[1..].iter() {
-                if line.is_empty() { continue }
-                let toks: Vec<&str> = line.split(":").collect();
-                let [word, freq] = toks[..] else {
-                    println!("{line}");
-                    panic!("Could not parse Bow line");
+            for line in lines {
+                let Some((word, freq)) = line.split_once(":") else {
+                    panic!("Could not parse Bow line:\n {}", line);
                 };
                 bow.words.insert(word.to_string(), freq.parse::<u32>().unwrap());
             }
@@ -145,8 +145,8 @@ impl SpamFilter {
         sf.ham_bow = Bow::new();
 
         let s = &content;
-        let end_spam = s.find('}').expect("Expeted '}' in model file");
-        let end_ham = s.rfind('}').expect("Expeted '}' in model file");
+        let end_spam = s.find('}').expect("Expeted '}' in file");
+        let end_ham = s.rfind('}').expect("Expeted '}' in file");
         read_bow(&s[..end_spam], &mut sf.spam_bow);
         read_bow(&s[end_spam+1..end_ham], &mut sf.ham_bow);
 
@@ -175,9 +175,9 @@ impl SpamFilter {
         for dir in data_dirs {
             let dir_path = Path::new(dir);
             self.spam_bow.load_entire_dir(&dir_path.join("spam"))
-                .expect("Could not load data from dir");
+                .expect("Could not load data from training dir");
             self.ham_bow.load_entire_dir(&dir_path.join("ham"))
-                .expect("Could not load data from dir");
+                .expect("Could not load data from training dir");
         }
 
         let total_documents = self.spam_bow.total_documents + self.ham_bow.total_documents;
@@ -212,13 +212,14 @@ impl SpamFilter {
         let confidence = 1.0 / (1.0 + diff.exp());
 
         if confidence > 0.5 {
-            Classification::Spam(confidence)
+            Spam(confidence)
         } else {
-            Classification::Ham(confidence)
+            Ham(1.0 - confidence)
         }
     }
 
     fn test_predictions(&self, data_dir: &str) {
+        println!("Testing on {data_dir}");
         let spam_entries = fs::read_dir(Path::new(data_dir).join("spam"))
             .expect("Could not open test spam dir");
         let ham_entries = fs::read_dir(Path::new(data_dir).join("ham"))
@@ -281,13 +282,15 @@ fn main() {
         }
     }
 
-    let clf = match SpamFilter::load_from_file("model.sf") {
+    let model_file = "model.sf";
+    let clf = match SpamFilter::load_from_file(model_file) {
         Ok(sf) => sf,
         Err(_) => {
+            println!("Could not load '{model_file}', retraining...");
             // Train a new one
             let mut sf = SpamFilter::new();
-            sf.fit_data(&TRAINING_DATA);
-            sf.save_to_file("model.sf").expect("Could not save file");
+            sf.fit_data(&TRAINING_SET);
+            sf.save_to_file(model_file).expect("Could not save file");
             sf
         }
     };
@@ -295,7 +298,7 @@ fn main() {
     if test {
         match test_dir {
             Some(dir) => clf.test_predictions(dir),
-            None => clf.test_predictions(TEST_DATA),
+            None => clf.test_predictions(TEST_SET),
         }
         return
     }
@@ -319,9 +322,9 @@ fn main() {
 
     for result in results {
         match result {
-            (file, Classification::Spam(confidence)) =>
+            (file, Spam(confidence)) =>
                 println!("{file}: SPAM ({:.4}%)", 100.0*confidence),
-            (file, Classification::Ham(confidence)) =>
+            (file, Ham(confidence)) =>
                 println!("{file}: NOT SPAM ({:.4}%)", 100.0*confidence),
         }
     }
